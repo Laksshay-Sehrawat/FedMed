@@ -35,12 +35,14 @@ BTP repo by Laksshay, Vanshika, Saumya
 
   In the first terminal, run the first client:
   ```sh
-    python client/client.py ../data/client1
+    cd client
+    python client.py ../data/client1
   ```
 
   In the second terminal, run the second client:
   ```sh
-    python client/client.py ../data/client2
+    cd client
+    python client.py ../data/client2
   ```
 
 
