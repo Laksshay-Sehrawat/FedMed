@@ -29,18 +29,18 @@ BTP repo by Laksshay, Vanshika, Saumya
 
   Start the Flower server:
   ```sh
-    python server.py
+    python server/server.py
   ```
   Running the Clients -> Open two terminal windows.
 
   In the first terminal, run the first client:
   ```sh
-    python client.py ./data/client1
+    python client/client.py ../data/client1
   ```
 
   In the second terminal, run the second client:
   ```sh
-    python client.py ./data/client2
+    python client/client.py ../data/client2
   ```
 
 
