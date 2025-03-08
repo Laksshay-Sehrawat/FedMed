@@ -257,7 +257,7 @@ if __name__ == "__main__":
             fl.client.start_numpy_client(
                 server_address="0.0.0.0:8080",
                 client=client,
-                grpc_max_message_length=1000 * 1024 * 1024,
+                grpc_max_message_length=1024 * 1024 * 1024,
                 root_certificates=None
             )
             break  # Success - exit loop
