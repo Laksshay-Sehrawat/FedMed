@@ -40,7 +40,6 @@ class TrustBasedStrategy(FedAvg):
     def on_evaluate_config_fn(self, rnd: int):
         # logger.info(f"Configuring round {rnd} for evaluation")
         return super().on_evaluate_config_fn(rnd)
-
     def aggregate_fit(
         self,
         rnd: int,
@@ -60,14 +59,38 @@ class TrustBasedStrategy(FedAvg):
         # Filter out unreliable clients
         valid_indices = [i for i, reliable in enumerate(reliability_flags) if reliable == 1]
         
-        if not valid_indices:
-            logger.warning("No reliable clients found, using all clients for this round")
-            valid_indices = list(range(len(results)))
-        
-        # Convert parameters to lists of numpy arrays
+        # Convert all parameters to lists of numpy arrays 
         all_weights = [fl.common.parameters_to_ndarrays(params) for params, _ in weights_results]
         
-        # Get only valid weights
+        # Check if all clients are unreliable
+        if not valid_indices:
+            logger.warning("No reliable clients found - using DIRECT FedAvg aggregation")
+            
+            # Use simple FedAvg directly on the complete model
+            num_clients = len(all_weights)
+            if num_clients == 0:
+                return None, {}
+                
+            # Simple average of all weights - this preserves the model architecture exactly
+            aggregated_weights = [
+                np.sum([weights[i] for weights in all_weights], axis=0) / num_clients
+                for i in range(len(all_weights[0]))
+            ]
+            
+            # Calculate aggregated metrics by simple averaging
+            aggregated_metrics = {}
+            for _, metrics in weights_results:
+                for k, v in metrics.items():
+                    if isinstance(v, (int, float)):
+                        aggregated_metrics[k] = aggregated_metrics.get(k, 0) + v / num_clients
+            
+            logger.info(f"Direct FedAvg complete - aggregated {len(aggregated_weights)} weight tensors")
+            
+            # Return the directly averaged weights
+            return fl.common.ndarrays_to_parameters(aggregated_weights), aggregated_metrics
+        
+        # If we have reliable clients, proceed with the original trust-based aggregation
+        # Get only valid weights from reliable clients
         valid_weights = [all_weights[i] for i in valid_indices]
         valid_trust_scores = [trust_scores[i] for i in valid_indices]
         valid_confidence_scores = [confidence_scores[i] for i in valid_indices]
@@ -94,42 +117,33 @@ class TrustBasedStrategy(FedAvg):
             else:
                 personalized_indices.append(idx)
         
-        # Only apply secure aggregation for certain rounds (e.g., every 3rd round)
-        use_secure_agg = (rnd % 3 == 0)
+        # Safer approach - just use standard weighted averaging for all layers
+        # This still preserves the advantages of trust-based aggregation while being less error-prone
         
-        # Process base layers
-        base_aggregated_weights = []
-        for idx in base_indices:
-            if idx < len(valid_weights[0]):
-                layer_weights = [client_w[idx] for client_w in valid_weights]
-                equal_weights = np.ones(len(valid_weights)) / len(valid_weights)
+        # Initialize aggregated weights with the same structure as the input weights
+        aggregated_weights = []
+        
+        # For each layer in the model
+        for layer_idx in range(len(valid_weights[0])):
+            # Get all clients' weights for this layer
+            layer_weights = [client_w[layer_idx] for client_w in valid_weights]
+            
+            # Choose weights based on layer type
+            if layer_idx in base_indices:
+                # Base layers use equal weights
+                weights_to_use = np.ones(len(valid_weights)) / len(valid_weights)
+            else:
+                # Personalized layers use confidence-weighted aggregation
+                weights_to_use = norm_confidence_scores
                 
-                if use_secure_agg:
-                    # Use secure aggregation
-                    aggregated_layer = self.secure_aggregate([layer_weights], [equal_weights])[0]
-                else:
-                    # Use standard aggregation (much faster)
-                    aggregated_layer = np.zeros_like(layer_weights[0])
-                    for w in layer_weights:
-                        aggregated_layer += w / len(layer_weights)
-                        
-                base_aggregated_weights.append((idx, aggregated_layer))
+            # Weighted average for this layer
+            layer_agg = np.zeros_like(layer_weights[0])
+            for i, w in enumerate(layer_weights):
+                layer_agg += w * weights_to_use[i]
+                
+            aggregated_weights.append(layer_agg)
         
-        # Process personalized layers - Confidence-weighted aggregation
-        personalized_aggregated_weights = []
-        for idx in personalized_indices:
-            if idx < len(valid_weights[0]):  # Make sure index is valid
-                layer_weights = [client_w[idx] for client_w in valid_weights]
-                # Use secure aggregation for personalized layers with confidence weights
-                aggregated_layer = self.secure_aggregate([layer_weights], [norm_confidence_scores])[0]
-                personalized_aggregated_weights.append((idx, aggregated_layer))
-        
-        # Combine all aggregated weights in the correct order
-        all_aggregated = base_aggregated_weights + personalized_aggregated_weights
-        all_aggregated.sort(key=lambda x: x[0])  # Sort by index
-        aggregated_weights = [w for _, w in all_aggregated]
-        
-        # Calculate aggregated metrics
+        # Calculate aggregated metrics using trust scores for weighting
         aggregated_metrics = {}
         metric_keys = ["accuracy", "loss", "precision", "recall", "f1_score", "trust_score", "confidence"]
         
@@ -144,13 +158,19 @@ class TrustBasedStrategy(FedAvg):
         self.round_metrics[rnd] = aggregated_metrics
         
         # Log results
-        logger.info(f"Round {rnd} aggregation complete with secure aggregation")
+        logger.info(f"Round {rnd} aggregation complete")
         logger.info(f"Used {len(valid_indices)}/{len(results)} clients")
         logger.info(f"Aggregated metrics: Acc={aggregated_metrics.get('accuracy', 0):.4f}, " 
                     f"F1={aggregated_metrics.get('f1_score', 0):.4f}")
         
+        # Verify structure hasn't changed
+        if len(aggregated_weights) != len(all_weights[0]):
+            logger.error(f"CRITICAL: Aggregation changed layer count from {len(all_weights[0])} to {len(aggregated_weights)}")
+            # Fallback to first client's weights as a last resort
+            return fl.common.ndarrays_to_parameters(all_weights[0]), aggregated_metrics
+        
+        # Return the aggregated weights and metrics
         return fl.common.ndarrays_to_parameters(aggregated_weights), aggregated_metrics
-
     def aggregate_evaluate(
         self,
         rnd: int,
@@ -201,8 +221,12 @@ class TrustBasedStrategy(FedAvg):
 
     def secure_aggregate(self, weights_list, trust_weights, noise_scale=0.0001):
         """Optimized secure aggregation with reduced computational overhead"""
-        # Skip noise addition for large tensors (e.g., convolutional layers)
-        # Only add noise to sensitive layers like the final dense layers
+        # Unwrap the nested lists if necessary
+        if len(weights_list) == 1 and isinstance(weights_list[0], list):
+            weights_list = weights_list[0]
+        
+        if len(trust_weights) == 1 and isinstance(trust_weights[0], (list, np.ndarray)):
+            trust_weights = trust_weights[0]
         
         aggregated_weights = []
         for layer_weights in zip(*weights_list):

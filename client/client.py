@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 
 # Constants for trust score calculation
 TEST_BATCH_SIZE = 32
-W_ACC = 0.3   # Weight for accuracy
-W_F1 = 0.3    # Weight for F1 score
+W_ACC = 0.4   # Weight for accuracy
+W_F1 = 0.2    # Weight for F1 score
 W_CONF = 0.2  # Weight for confidence
 W_LOSS = 0.2  # Weight for loss
 TRUST_THRESHOLD = 0.2  # 20% threshold for trust score deviation
@@ -160,10 +160,20 @@ class Client(fl.client.NumPyClient):
     def _validate_parameters(self, parameters):
         """Validate parameter structure before setting weights"""
         if len(parameters) != self.expected_weights_count:
-            logger.error(f"Parameter mismatch! Expected {self.expected_weights_count} layers, got {len(parameters)}")
-            logger.debug("Parameter shapes received:")
-            for i, p in enumerate(parameters):
-                logger.debug(f"Layer {i}: {p.shape if hasattr(p, 'shape') else 'Invalid'}")
+            logger.error(f"ARCHITECTURE MISMATCH: Expected {self.expected_weights_count} layers, got {len(parameters)}")
+            
+            logger.error("Client model structure:")
+            for i, layer in enumerate(self.model.layers):
+                layer_weights = layer.get_weights()
+                if layer_weights:
+                    logger.error(f"Layer {i}: {layer.name} - {[w.shape for w in layer_weights]}")
+                else:
+                    logger.error(f"Layer {i}: {layer.name} - No weights")
+            
+            logger.error("Received parameter structure:")
+            for i, param in enumerate(parameters):
+                logger.error(f"Param {i}: shape {param.shape if hasattr(param, 'shape') else 'Unknown'}")
+            
             raise ValueError("Server-client model architecture mismatch")
 
     def get_parameters(self, config):
@@ -183,7 +193,7 @@ class Client(fl.client.NumPyClient):
             raise
 
         steps_per_epoch = len(self.train_generator)
-        epochs = 5
+        epochs = 2
 
         early_stopping = EarlyStopping(
             monitor='val_loss',
@@ -229,9 +239,28 @@ class Client(fl.client.NumPyClient):
             self._validate_parameters(parameters)
             self.model.set_weights(parameters)
         except ValueError as e:
-            logger.error("Evaluation failed due to parameter mismatch")
-            logger.error("Verify server and client model architectures match exactly")
-            raise
+            logger.error("Parameter structure mismatch detected")
+            
+            # TOLERANCE MECHANISM: If layer count is different but close, try adaptation
+            if hasattr(parameters, "__len__") and abs(len(parameters) - self.expected_weights_count) <= 2:
+                logger.warning("Attempting to adapt to server model structure changes")
+                # Reinitialize model to match server structure
+                try:
+                    # Create a new model with a matching structure
+                    new_model = create_model()
+                    if len(parameters) == len(new_model.get_weights()):
+                        logger.info("Model adaptation successful")
+                        self.model = new_model
+                        self.expected_weights_count = len(parameters)
+                        self.model.set_weights(parameters)
+                    else:
+                        logger.error("Model adaptation failed - incompatible structures")
+                        raise e
+                except Exception as adapt_error:
+                    logger.error(f"Adaptation error: {str(adapt_error)}")
+                    raise e
+            else:
+                raise
         
         # Evaluate and get comprehensive metrics
         trust_score, metrics = calculate_trust_score(self.model, self.val_generator)
